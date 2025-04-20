@@ -348,15 +348,30 @@ class DownloadWorker(BaseDownloader):
                                 text=True,
                                 check=True,
                             )
+                            if "out of bounds" in result.stdout.lower():
+                                LOGGER.info(result.stdout)
+                                # Break the loop and clean up immediately
+                                LOGGER.info("All GeoJSON files likely out of bounds. Aborting processing and cleaning up.")
+                                break
+                            # Log the successful processing of the GeoJSON file
                             LOGGER.info(f"Successfully processed {os.path.basename(json_file)}")
                             LOGGER.info(result.stdout)
                             success_count += 1
                         except subprocess.CalledProcessError as e:
-                            LOGGER.error(f"Error processing {os.path.basename(json_file)}: {e}")
-                            LOGGER.error(f"Command: {e.cmd}")
-                            LOGGER.error(f"Exit Code: {e.returncode}")
-                            LOGGER.error(f"Stderr: {e.stderr}")
-                            LOGGER.error(f"Stdout: {e.stdout}")
+                            # Check if the error is "Station is out of bounds"
+                            error_message = e.stderr + e.stdout  # Combine stderr and stdout to catch the error
+                            if "out of bounds" in error_message.lower():
+                                LOGGER.info(f"Skipped {os.path.basename(json_file)}: Station is out of bounds")
+                                # Break the loop and clean up immediately
+                                LOGGER.info("All GeoJSON files likely out of bounds. Aborting processing and cleaning up.")
+                                break
+                            else:
+                                # Log other errors as critical
+                                LOGGER.error(f"Error processing {os.path.basename(json_file)}: {e}")
+                                LOGGER.error(f"Command: {e.cmd}")
+                                LOGGER.error(f"Exit Code: {e.returncode}")
+                                LOGGER.error(f"Stderr: {e.stderr}")
+                                LOGGER.error(f"Stdout: {e.stdout}")
 
                     LOGGER.info(
                         f"Completed processing. Successfully processed {success_count} out of {len(json_files)} GeoJSON files."
@@ -367,15 +382,9 @@ class DownloadWorker(BaseDownloader):
                     LOGGER.error(e.stderr)
 
                 finally:
-                    # Clean up temporary GeoJSON files
-                    for json_file in glob.glob(str(temp_dir / '*')):
-                        try:
-                           os.remove(json_file)
-                           pass
-                        except OSError as e:
-                            LOGGER.warning(f"Error removing {json_file}: {e}")
+                    # Clean up temporary directory and all its contents
                     try:
-                        temp_dir.rmdir()
+                        shutil.rmtree(temp_dir)
                         LOGGER.info(f"Removed temporary directory {temp_dir}")
                     except OSError as e:
                         LOGGER.warning(f"Error removing directory {temp_dir}: {e}")
