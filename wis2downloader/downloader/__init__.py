@@ -349,6 +349,7 @@ class DownloadWorker(BaseDownloader):
                                 check=True,
                             )
                             LOGGER.info(f"Successfully processed {os.path.basename(json_file)}")
+                            LOGGER.info(result.stdout)
                             success_count += 1
                         except subprocess.CalledProcessError as e:
                             LOGGER.error(f"Error processing {os.path.basename(json_file)}: {e}")
