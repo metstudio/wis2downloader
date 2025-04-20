@@ -4,6 +4,9 @@ from urllib.parse import urlsplit
 import hashlib
 import base64
 import os
+import uuid
+import subprocess
+import glob
 from datetime import datetime as dt
 from pathlib import Path
 import enum
@@ -294,15 +297,83 @@ class DownloadWorker(BaseDownloader):
 
         return True
 
-    def save_file(self, data, target, filename, filesize,
-                  download_start) -> None:
+    def save_file(self, data, target, filename, filesize, download_start) -> None:
         try:
+            # Save the downloaded file to disk
             target.write_bytes(data)
             download_end = dt.now()
             download_time = download_end - download_start
             download_seconds = round(download_time.total_seconds(), 2)
             LOGGER.info(
-                f"Downloaded {filename} of size {filesize} bytes in {download_seconds} seconds")  # noqa
+                f"Downloaded {filename} of size {filesize} bytes in {download_seconds} seconds"
+            )
+
+            # Check if the file is a BUFR file (based on extension)
+            if filename.endswith('.bufr') or filename.endswith('.bin'):
+                LOGGER.info(f"Detected BUFR file: {filename}. Converting to GeoJSON and processing...")
+
+                # Paths to bufr2geojson and manage.py (adjust as needed)
+                python_venv_path = '/home/rimes/observation/venv/bin/python'
+                bufr2geojson_path = '/home/rimes/observation/venv/bin/bufr2geojson'
+
+                # Create a unique temporary directory for GeoJSON files
+                unique_id = str(uuid.uuid4())[:8]
+                temp_dir = self.basepath / f"output/temp_json_files_{unique_id}"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    # Convert BUFR to GeoJSON using bufr2geojson CLI
+                    cmd = [bufr2geojson_path, 'data', 'transform', str(target), '--output-dir', str(temp_dir)]
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    LOGGER.info(f"Converted BUFR to GeoJSON: {result.stdout}")
+
+                    # Find all generated GeoJSON files
+                    json_files = glob.glob(str(temp_dir / '*.json'))
+                    LOGGER.info(f"Found {len(json_files)} GeoJSON files to process.")
+
+                    # Process each GeoJSON file using the Django management command
+                    success_count = 0
+                    for json_file in json_files:
+                        LOGGER.info(f"Processing GeoJSON file: {os.path.basename(json_file)}")
+                        try:
+                            result = subprocess.run(
+                                [python_venv_path, 'manage.py', 'update_obs_data', json_file],
+                                capture_output=True,
+                                text=True,
+                                check=True,
+                            )
+                            LOGGER.info(f"Successfully processed {os.path.basename(json_file)}")
+                            success_count += 1
+                        except subprocess.CalledProcessError as e:
+                            LOGGER.error(f"Error processing {os.path.basename(json_file)}: {e}")
+                            LOGGER.error(e.stderr)
+
+                    LOGGER.info(
+                        f"Completed processing. Successfully processed {success_count} out of {len(json_files)} GeoJSON files."
+                    )
+
+                except subprocess.CalledProcessError as e:
+                    LOGGER.error(f"Error converting BUFR file {filename}: {e}")
+                    LOGGER.error(e.stderr)
+
+                finally:
+                    # Clean up temporary GeoJSON files
+                    for json_file in glob.glob(str(temp_dir / '*')):
+                        try:
+                            os.remove(json_file)
+                        except OSError as e:
+                            LOGGER.warning(f"Error removing {json_file}: {e}")
+                    try:
+                        temp_dir.rmdir()
+                        LOGGER.info(f"Removed temporary directory {temp_dir}")
+                    except OSError as e:
+                        LOGGER.warning(f"Error removing directory {temp_dir}: {e}")
+
         except Exception as e:
             LOGGER.error(f"Error saving to disk: {target}")
             LOGGER.error(e)
