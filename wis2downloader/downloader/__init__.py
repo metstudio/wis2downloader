@@ -315,6 +315,7 @@ class DownloadWorker(BaseDownloader):
                 # Paths to bufr2geojson and manage.py (adjust as needed)
                 python_venv_path = '/home/rimes/observation/venv/bin/python'
                 bufr2geojson_path = '/home/rimes/observation/venv/bin/bufr2geojson'
+                manage_py_path = '/home/rimes/observation/manage.py'
 
                 # Create a unique temporary directory for GeoJSON files
                 unique_id = str(uuid.uuid4())[:8]
@@ -342,7 +343,7 @@ class DownloadWorker(BaseDownloader):
                         LOGGER.info(f"Processing GeoJSON file: {os.path.basename(json_file)}")
                         try:
                             result = subprocess.run(
-                                [python_venv_path, 'manage.py', 'update_obs_data', json_file],
+                                [python_venv_path, manage_py_path, 'update_obs_data', json_file],
                                 capture_output=True,
                                 text=True,
                                 check=True,
@@ -351,7 +352,10 @@ class DownloadWorker(BaseDownloader):
                             success_count += 1
                         except subprocess.CalledProcessError as e:
                             LOGGER.error(f"Error processing {os.path.basename(json_file)}: {e}")
-                            LOGGER.error(e.stderr)
+                            LOGGER.error(f"Command: {e.cmd}")
+                            LOGGER.error(f"Exit Code: {e.returncode}")
+                            LOGGER.error(f"Stderr: {e.stderr}")
+                            LOGGER.error(f"Stdout: {e.stdout}")
 
                     LOGGER.info(
                         f"Completed processing. Successfully processed {success_count} out of {len(json_files)} GeoJSON files."
@@ -365,7 +369,8 @@ class DownloadWorker(BaseDownloader):
                     # Clean up temporary GeoJSON files
                     for json_file in glob.glob(str(temp_dir / '*')):
                         try:
-                            os.remove(json_file)
+                           os.remove(json_file)
+                           pass
                         except OSError as e:
                             LOGGER.warning(f"Error removing {json_file}: {e}")
                     try:
