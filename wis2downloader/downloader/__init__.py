@@ -11,12 +11,15 @@ from datetime import datetime as dt
 from pathlib import Path
 import enum
 import shutil
+import json
 
 from wis2downloader import stop_event
 from wis2downloader.log import LOGGER
 from wis2downloader.queue import BaseQueue
 from wis2downloader.metrics import (DOWNLOADED_BYTES, DOWNLOADED_FILES,
                                     FAILED_DOWNLOADS)
+from wis2downloader.tasks import process_downloaded_file
+from wis2downloader.constants import map_media_type, VerificationMethods
 
 
 class BaseDownloader(ABC):
@@ -54,50 +57,6 @@ class BaseDownloader(ABC):
         """Extract the filename and extension from the download link"""
         pass
 
-    @abstractmethod
-    def validate_data(self, data, expected_hash, hash_function, expected_size):
-        """Validate the hash and size of the downloaded data against
-        the expected values"""
-        pass
-
-    @abstractmethod
-    def save_file(self, data, target, filename, filesize, download_start):
-        """Save the downloaded data to disk"""
-
-
-def get_todays_date():
-    """
-    Returns today's date in the format yyyy/mm/dd.
-    """
-    today = dt.now()
-    yyyy = f"{today.year:04}"
-    mm = f"{today.month:02}"
-    dd = f"{today.day:02}"
-    return yyyy, mm, dd
-
-
-def map_media_type(media_type):
-    _map = {
-        "application/x-bufr": "bufr",
-        "application/octet-stream": "bin",
-        "application/xml": "xml",
-        "image/jpeg": "jpeg",
-        "application/x-grib": "grib",
-        "application/grib;edition=2": "grib",
-        "text/plain": "txt"
-    }
-
-    return _map.get(media_type, 'bin')
-
-
-class VerificationMethods(enum.Enum):
-    sha256 = 'sha256'
-    sha384 = 'sha384'
-    sha512 = 'sha512'
-    sha3_256 = 'sha3_256'
-    sha3_384 = 'sha3_384'
-    sha3_512 = 'sha3_512'
-
 
 class DownloadWorker(BaseDownloader):
     def __init__(self, queue: BaseQueue, basepath: str = ".", min_free_space=10):  # noqa
@@ -107,6 +66,10 @@ class DownloadWorker(BaseDownloader):
         self.basepath = Path(basepath)
         self.min_free_space = min_free_space * 1073741824  # GBytes
         self.status = "ready"
+        self.LAT_MIN = -100
+        self.LAT_MAX = 15
+        self.LON_MIN = -30
+        self.LON_MAX = 60
 
     def start(self) -> None:
         LOGGER.info("Starting download worker")
@@ -124,20 +87,33 @@ class DownloadWorker(BaseDownloader):
 
             self.status = "ready"
             self.queue.task_done()
+            
+    def check_coordinates(self, coordinates):
+        """
+        Check if the coordinates are within the defined bounds.
+        """
+        # Check if coordinates are a list of coordinates, or just a single coordinate
+        # If it's a single coordinate, it should be a list of two elements [lat, lon]
+        # if it's a list of coordinates, it should be a list of lists
+        if isinstance(coordinates, list) and all(isinstance(coord, list) for coord in coordinates):
+            # Check if any coordinate pair is within bounds
+            return any(self.check_coordinates(coord) for coord in coordinates)
+        # If it's a single coordinate, check if it's a list of two elements
+        if not coordinates or not isinstance(coordinates, list) or len(coordinates) < 2:
+            return False
+        lat, lon = coordinates[0], coordinates[1]
+        return (self.LAT_MIN <= lat <= self.LAT_MAX and
+                self.LON_MIN <= lon <= self.LON_MAX)
 
     def get_free_space(self):
         total, used, free = shutil.disk_usage(self.basepath)
         return free
 
     def process_job(self, job) -> None:
-        yyyy, mm, dd = get_todays_date()
-        output_dir = self.basepath / yyyy / mm / dd
-
-        # Add target to output directory
-        output_dir = output_dir / job.get("target", ".")
 
         # Get information about the job for verification later
-        expected_hash, hash_function = self.get_hash_info(job)
+        expected_hash, hash_function_method = self.get_hash_info(job) # Renamed to avoid confusion with actual callable
+
 
         # Get the download url, update status, and file type from the job links
         _url, update, media_type, expected_size = self.get_download_url(job)
@@ -153,84 +129,37 @@ class DownloadWorker(BaseDownloader):
         # the data_id for uniqueness. However, this can be unwieldy, hence use
         # hash of data_id
         data_id = job.get('payload', {}).get('properties', {}).get('data_id')
-        filename, _ = self.extract_filename(_url)
-        filename = filename + '.' + file_type
-        target = output_dir / filename
-        # Create parent dir if it doesn't exist
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        # Only download if file doesn't exist or is an update
-        is_duplicate = target.is_file() and not update
-        if is_duplicate:
-            LOGGER.info(f"Skipping download of {filename}, already exists")
+        
+        # Get the coordinates from the job payload
+        coordinates = job.get('payload', {}).get('geometry', [])
+        coordinates = coordinates.get("coordinates", []) if isinstance(coordinates, dict) else coordinates
+        LOGGER.info(f"Coordinates for job {data_id}: {coordinates}")
+        
+        # Check if the coordinates are within the defined bounds
+        if not self.check_coordinates(coordinates):
+            LOGGER.warning(f"Coordinates {coordinates} are out of bounds, skipping download for job {data_id}")
             return
-
+        
+        LOGGER.info(f"Coordinates {coordinates} are within bounds, proceeding with download for job {data_id}")  # noqa         
+        
         # Get information needed for download metric labels
         topic, centre_id = self.get_topic_and_centre(job)
-
-        # Standardise the file type label, defaulting to 'other'
-        all_type_labels = ['bufr', 'grib', 'json', 'xml', 'png']
-        file_type_label = 'other'
-
-        for label in all_type_labels:
-            if label in file_type:
-                file_type_label = label
-                break
-
-        # Start timer of download time to be logged later
-        download_start = dt.now()
-
-        # Download the file
-        response = None
-        try:
-            response = self.http.request('GET', _url)
-            # Check the response status code
-            if response.status != 200:
-                LOGGER.error(f"Error downloading {_url}, received status code: {response.status}")
-                # Increment failed download counter
-                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-                return
-            # Get the filesize in KB
-            filesize = len(response.data)
-        except Exception as e:
-            LOGGER.error(f"Error downloading {_url}")
-            LOGGER.error(e)
-            # Increment failed download counter
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-            return
-
-        if self.min_free_space > 0:  # only check size if limit set
-            free_space = self.get_free_space()
-            if free_space < self.min_free_space:
-                LOGGER.warning(f"Too little free space, {free_space - filesize} < {self.min_free_space} , file {data_id} not saved")  # noqa
-                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-                return
-
-        if response is None:
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-            return
-
-        # Use the hash function to determine whether to save the data
-        save_data = self.validate_data(
-            response.data, expected_hash, hash_function, expected_size)
-
-        if not save_data:
-            LOGGER.warning(f"Download {data_id} failed verification, discarding")  # noqa
-            # Increment failed download counter
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-            return
-
-        # Now save
-        self.save_file(response.data, target, filename,
-                       filesize, download_start)
-
-        # Increment metrics
-        DOWNLOADED_BYTES.labels(
-            topic=topic, centre_id=centre_id,
-            file_type=file_type_label).inc(filesize)
-        DOWNLOADED_FILES.labels(
-            topic=topic, centre_id=centre_id,
-            file_type=file_type_label).inc(1)
+        
+        # Prepare metadata to pass to the Celery task
+        job_metadata = {
+            'target': job.get('target', '.'),
+            'expected_hash': expected_hash,
+            'hash_method': hash_function_method, # Pass the method name, not the function object
+            'expected_size': expected_size,
+            'media_type': media_type,
+            'topic': topic,
+            'centre_id': centre_id,
+            'data_id': data_id,
+            'update': update, # Pass 'update' flag as well if needed in task
+        }
+        
+        # Enqueue the task to Celery
+        process_downloaded_file.delay(_url, job_metadata, str(self.basepath))
 
     def get_topic_and_centre(self, job) -> tuple:
         topic = job.get('topic')
@@ -242,16 +171,7 @@ class DownloadWorker(BaseDownloader):
         hash_method = job.get('payload', {}).get(
             'properties', {}).get('integrity', {}).get('method')
 
-        hash_function = None
-
-        # Check if hash method is known using our enumumeration of hash methods
-        if hash_method in VerificationMethods._member_names_:
-            # get method
-            method = VerificationMethods[hash_method].value
-            # load and return from the hashlib library
-            hash_function = getattr(hashlib, method, None)
-
-        return expected_hash, hash_function
+        return expected_hash, hash_method
 
     def get_download_url(self, job) -> tuple:
         links = job.get('payload', {}).get('links', [])
@@ -279,116 +199,3 @@ class DownloadWorker(BaseDownloader):
         filename = os.path.basename(path)
         filename, filename_ext = os.path.splitext(filename)
         return filename, filename_ext
-
-    def validate_data(self, data, expected_hash,
-                      hash_function, expected_size) -> bool:
-        if None in (expected_hash, hash_function,
-                    hash_function):
-            return True
-
-        try:
-            hash_value = hash_function(data).digest()
-            hash_value = base64.b64encode(hash_value).decode()
-        except Exception as e:
-            LOGGER.error(e)
-            return False
-        if (hash_value != expected_hash) or (len(data) != expected_size):
-            return False
-
-        return True
-
-    def save_file(self, data, target, filename, filesize, download_start) -> None:
-        try:
-            # Save the downloaded file to disk
-            target.write_bytes(data)
-            download_end = dt.now()
-            download_time = download_end - download_start
-            download_seconds = round(download_time.total_seconds(), 2)
-            LOGGER.info(
-                f"Downloaded {filename} of size {filesize} bytes in {download_seconds} seconds"
-            )
-
-            # Check if the file is a BUFR file (based on extension)
-            if filename.endswith('.bufr') or filename.endswith('.bin'):
-                LOGGER.info(f"Detected BUFR file: {filename}. Converting to GeoJSON and processing...")
-
-                # Paths to bufr2geojson and manage.py (adjust as needed)
-                python_venv_path = '/home/rimes/observation/venv/bin/python'
-                bufr2geojson_path = '/home/rimes/observation/venv/bin/bufr2geojson'
-                manage_py_path = '/home/rimes/observation/manage.py'
-
-                # Create a unique temporary directory for GeoJSON files
-                unique_id = str(uuid.uuid4())[:8]
-                temp_dir = self.basepath / f"output/temp_json_files_{unique_id}"
-                temp_dir.mkdir(parents=True, exist_ok=True)
-
-                try:
-                    # Convert BUFR to GeoJSON using bufr2geojson CLI
-                    cmd = [bufr2geojson_path, 'data', 'transform', str(target), '--output-dir', str(temp_dir)]
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    )
-                    LOGGER.info(f"Converted BUFR to GeoJSON: {result.stdout}")
-
-                    # Find all generated GeoJSON files
-                    json_files = glob.glob(str(temp_dir / '*.json'))
-                    LOGGER.info(f"Found {len(json_files)} GeoJSON files to process.")
-
-                    # Process each GeoJSON file using the Django management command
-                    success_count = 0
-                    for json_file in json_files:
-                        LOGGER.info(f"Processing GeoJSON file: {os.path.basename(json_file)}")
-                        try:
-                            result = subprocess.run(
-                                [python_venv_path, manage_py_path, 'update_obs_data', json_file],
-                                capture_output=True,
-                                text=True,
-                                check=True,
-                            )
-                            if "out of bounds" in result.stdout.lower():
-                                LOGGER.info(result.stdout)
-                                # Break the loop and clean up immediately
-                                LOGGER.info("All GeoJSON files likely out of bounds. Aborting processing and cleaning up.")
-                                break
-                            # Log the successful processing of the GeoJSON file
-                            LOGGER.info(f"Successfully processed {os.path.basename(json_file)}")
-                            LOGGER.info(result.stdout)
-                            success_count += 1
-                        except subprocess.CalledProcessError as e:
-                            # Check if the error is "Station is out of bounds"
-                            error_message = e.stderr + e.stdout  # Combine stderr and stdout to catch the error
-                            if "out of bounds" in error_message.lower():
-                                LOGGER.info(f"Skipped {os.path.basename(json_file)}: Station is out of bounds")
-                                # Break the loop and clean up immediately
-                                LOGGER.info("All GeoJSON files likely out of bounds. Aborting processing and cleaning up.")
-                                break
-                            else:
-                                # Log other errors as critical
-                                LOGGER.error(f"Error processing {os.path.basename(json_file)}: {e}")
-                                LOGGER.error(f"Command: {e.cmd}")
-                                LOGGER.error(f"Exit Code: {e.returncode}")
-                                LOGGER.error(f"Stderr: {e.stderr}")
-                                LOGGER.error(f"Stdout: {e.stdout}")
-
-                    LOGGER.info(
-                        f"Completed processing. Successfully processed {success_count} out of {len(json_files)} GeoJSON files."
-                    )
-
-                except subprocess.CalledProcessError as e:
-                    LOGGER.error(f"Error converting BUFR file {filename}: {e}")
-                    LOGGER.error(e.stderr)
-
-                finally:
-                    # Clean up temporary directory and all its contents
-                    try:
-                        shutil.rmtree(temp_dir)
-                        LOGGER.info(f"Removed temporary directory {temp_dir}")
-                    except OSError as e:
-                        LOGGER.warning(f"Error removing directory {temp_dir}: {e}")
-
-        except Exception as e:
-            LOGGER.error(f"Error saving to disk: {target}")
-            LOGGER.error(e)
