@@ -109,13 +109,8 @@ class DownloadWorker(BaseDownloader):
         # Load configuration settings
         
         # Check if Celery is enabled and set up the flags accordingly
-        # This will ensure that the Celery app is initialized only if use_celery is True
         self.use_celery = CONFIG.get('use_celery', False)
-        if self.use_celery:
-            # Ensure that the celery settings are valid
-            if 'CELERY_BROKER_URL' not in CONFIG or 'CELERY_RESULT_BACKEND' not in CONFIG:
-                raise ValueError("CELERY_BROKER_URL and CELERY_RESULT_BACKEND must be set in the configuration.")
-            
+        
         # Set up directories and paths
         self.basepath = self.basepath.resolve()
         if not self.basepath.is_dir():
@@ -124,12 +119,30 @@ class DownloadWorker(BaseDownloader):
         # Set up directories for saving downloaded files
         self.save_bufr = CONFIG.get('save_bufr', True)
         self.save_geojson = CONFIG.get('save_geojson', False)
-        self.download_dir = CONFIG.get('download_dir', self.basepath)
+        self.download_dir = CONFIG.get('download_dir', self.basepath / 'downloads')
         self.geojson_dir = CONFIG.get('geojson_dir', self.basepath / 'geojson')
-        self.bufr2geojson_path = CONFIG.get('bufr2geojson_path', None)
+        
+        if self.save_bufr:
+            # Check if the download directory exists, if not create it
+            if not self.download_dir.is_dir():
+                self.download_dir.mkdir(parents=True, exist_ok=True)
+            self.download_dir = self.download_dir.resolve()
+        else:
+            self.download_dir = None
+            
+        if self.save_geojson:
+            # Check if the geojson directory exists, if not create it
+            if not self.geojson_dir.is_dir():
+                self.geojson_dir.mkdir(parents=True, exist_ok=True)
+            self.geojson_dir = self.geojson_dir.resolve()
+        else:
+            self.geojson_dir = None
+            
+        
+        self.bufr2geojson_path = "bufr2geojson"
         if self.save_geojson and not self.check_geojson_conversion():
             raise ValueError("GeoJSON conversion is enabled but the configuration is invalid. "
-                             "Please check the 'bufr2geojson_path' and 'geojson_dir' settings in your configuration file."
+                             "Please check the 'geojson_dir' setting in your configuration file."
                              "Also make sure that Celery is enabled if you want to use GeoJSON conversion.")
         
         self.bounds = CONFIG.get('bounds', None)

@@ -20,6 +20,7 @@ requires-python = ">=3.8"
 keywords = ["WIS2.0", "MQTT", "subscribe", "download"]
 license = {file = "LICENSE"}
 dependencies = [
+    "",
     "click",
     "certifi>=2024.2.2",
     "flask>=3.0.3",
@@ -41,5 +42,5 @@ wis2downloader = "wis2downloader:cli.cli"
 version = {attr = "wis2downloader.__version__"}
 
 [project.optional-dependencies]
-redis = ["celery", "redis>=4.0.0"]
-rabbitmq = ["celery", "amqp>=5.0.0"]
+redis = ["celery", "redis>=4.0.0", "bufr2geojson"]
+rabbitmq = ["celery", "amqp>=5.0.0", "bufr2geojson"]
