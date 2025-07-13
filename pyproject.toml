@@ -20,7 +20,6 @@ requires-python = ">=3.8"
 keywords = ["WIS2.0", "MQTT", "subscribe", "download"]
 license = {file = "LICENSE"}
 dependencies = [
-    "",
     "click",
     "certifi>=2024.2.2",
     "flask>=3.0.3",
