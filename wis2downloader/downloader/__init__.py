@@ -181,9 +181,15 @@ class DownloadWorker(BaseDownloader):
         return free
 
     def process_job(self, job) -> None:
+        """
+        Process a single job from the queue.
+        Args:
+            job: The job to process, which is a dictionary containing the job details.
+        """
+        data_id = job.get('payload', {}).get('properties', {}).get('data_id', 'Unknown Job')
         
         if self.check_bounds and not self.is_job_within_bounds(job):
-            LOGGER.info(f"Skipping job {job} as it is outside the defined bounds.")
+            LOGGER.info(f"Skipping {data_id} as it is outside the defined bounds.")
             return
         
         yyyy, mm, dd = get_todays_date()
@@ -380,10 +386,6 @@ class DownloadWorker(BaseDownloader):
         lon_min = self.bounds['lon_min']
         lon_max = self.bounds['lon_max']
         
-        # Check if bounds are valid
-        if not self.check_bounds_validity():
-            LOGGER.warning("Invalid bounds detected.")
-            return False
 
         return (lat_min <= lat_max and lon_min <= lon_max and
                 -90 <= lat_min <= 90 and -90 <= lat_max <= 90 and
@@ -408,29 +410,30 @@ class DownloadWorker(BaseDownloader):
             return False
 
         return self.check_coordinates(coordinates)
-    
+
+    @staticmethod
     def validate_and_get_executable_path(path_from_config: str) -> str:
         """
         Validates the user-provided path for an executable.
 
         Args:
-            path_from_config: The path string from the config file.
+            path_from_config: The path or name of the executable to validate.
 
         Returns:
-            The absolute path to the executable if found.
+            The absolute path to the executable as a string.
 
         Raises:
+            ValueError: If the path is not provided.
             FileNotFoundError: If the executable cannot be found.
         """
-        # shutil.which() searches the PATH for a command or verifies an absolute path.
+        if not path_from_config:
+            raise ValueError("'bufr2geojson_path' must be set in config when celery is enabled.")
         absolute_path = shutil.which(path_from_config)
-
         if absolute_path is None:
             raise FileNotFoundError(
                 f"The executable could not be found for '{path_from_config}'. "
                 "Please ensure it's installed and the path in your config is correct."
             )
-
         return absolute_path
     
     def check_geojson_conversion(self) -> bool:
@@ -446,11 +449,14 @@ class DownloadWorker(BaseDownloader):
         if not self.bufr2geojson_path:
             LOGGER.warning("Path to bufr2geojson is not set.")
             return False
-        if not self.validate_and_get_executable_path(self.bufr2geojson_path):
-            LOGGER.warning(f"bufr2geojson executable not found at {self.bufr2geojson_path}.")
+        try:
+            self.validate_and_get_executable_path(self.bufr2geojson_path)
+        except (ValueError, FileNotFoundError) as e:
+            LOGGER.warning(f"bufr2geojson executable not found at {self.bufr2geojson_path}: {e}")
             return False
         return True
-    
+
+    @staticmethod
     def validate_post_config(config: dict) -> tuple[bool, str]:
         """
         Validates the post configuration dictionary to ensure it's proper.
