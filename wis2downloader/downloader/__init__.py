@@ -4,23 +4,18 @@ from urllib.parse import urlsplit
 import hashlib
 import base64
 import os
-import uuid
-import subprocess
-import glob
 from datetime import datetime as dt
 from pathlib import Path
 import enum
 import shutil
-import json
 
 from wis2downloader import stop_event
 from wis2downloader.log import LOGGER
 from wis2downloader.queue import BaseQueue
 from wis2downloader.metrics import (DOWNLOADED_BYTES, DOWNLOADED_FILES,
                                     FAILED_DOWNLOADS)
-from wis2downloader.tasks import process_downloaded_file
-from wis2downloader.constants import map_media_type, VerificationMethods
-
+from wis2downloader.tasks import process_bufr_data
+from wis2downloader.app import CONFIG
 
 class BaseDownloader(ABC):
 
@@ -57,6 +52,50 @@ class BaseDownloader(ABC):
         """Extract the filename and extension from the download link"""
         pass
 
+    @abstractmethod
+    def validate_data(self, data, expected_hash, hash_function, expected_size):
+        """Validate the hash and size of the downloaded data against
+        the expected values"""
+        pass
+
+    @abstractmethod
+    def save_file(self, data, target, filename, filesize, download_start):
+        """Save the downloaded data to disk"""
+
+
+def get_todays_date():
+    """
+    Returns today's date in the format yyyy/mm/dd.
+    """
+    today = dt.now()
+    yyyy = f"{today.year:04}"
+    mm = f"{today.month:02}"
+    dd = f"{today.day:02}"
+    return yyyy, mm, dd
+
+
+def map_media_type(media_type):
+    _map = {
+        "application/x-bufr": "bufr",
+        "application/octet-stream": "bin",
+        "application/xml": "xml",
+        "image/jpeg": "jpeg",
+        "application/x-grib": "grib",
+        "application/grib;edition=2": "grib",
+        "text/plain": "txt"
+    }
+
+    return _map.get(media_type, 'bin')
+
+
+class VerificationMethods(enum.Enum):
+    sha256 = 'sha256'
+    sha384 = 'sha384'
+    sha512 = 'sha512'
+    sha3_256 = 'sha3_256'
+    sha3_384 = 'sha3_384'
+    sha3_512 = 'sha3_512'
+
 
 class DownloadWorker(BaseDownloader):
     def __init__(self, queue: BaseQueue, basepath: str = ".", min_free_space=10):  # noqa
@@ -66,10 +105,59 @@ class DownloadWorker(BaseDownloader):
         self.basepath = Path(basepath)
         self.min_free_space = min_free_space * 1073741824  # GBytes
         self.status = "ready"
-        self.LAT_MIN = -100
-        self.LAT_MAX = 15
-        self.LON_MIN = -30
-        self.LON_MAX = 60
+        
+        # Load configuration settings
+        
+        # Check if Celery is enabled and set up the flags accordingly
+        # This will ensure that the Celery app is initialized only if use_celery is True
+        self.use_celery = CONFIG.get('use_celery', False)
+        if self.use_celery:
+            # Ensure that the celery settings are valid
+            if 'CELERY_BROKER_URL' not in CONFIG or 'CELERY_RESULT_BACKEND' not in CONFIG:
+                raise ValueError("CELERY_BROKER_URL and CELERY_RESULT_BACKEND must be set in the configuration.")
+            
+        # Set up directories and paths
+        self.basepath = self.basepath.resolve()
+        if not self.basepath.is_dir():
+            raise ValueError(f"Base path {self.basepath} is not a valid directory.")
+        
+        # Set up directories for saving downloaded files
+        self.save_bufr = CONFIG.get('save_bufr', True)
+        self.save_geojson = CONFIG.get('save_geojson', False)
+        self.download_dir = CONFIG.get('download_dir', self.basepath)
+        self.geojson_dir = CONFIG.get('geojson_dir', self.basepath / 'geojson')
+        self.bufr2geojson_path = CONFIG.get('bufr2geojson_path', None)
+        if self.save_geojson and not self.check_geojson_conversion():
+            raise ValueError("GeoJSON conversion is enabled but the configuration is invalid. "
+                             "Please check the 'bufr2geojson_path' and 'geojson_dir' settings in your configuration file."
+                             "Also make sure that Celery is enabled if you want to use GeoJSON conversion.")
+        
+        self.bounds = CONFIG.get('bounds', None)
+        if self.bounds is None:
+            self.check_bounds = False
+        else:
+            self.check_bounds = True
+            self.bounds = {
+                'lat_min': self.bounds.get('lat_min', -90),
+                'lat_max': self.bounds.get('lat_max', 90),
+                'lon_min': self.bounds.get('lon_min', -180),
+                'lon_max': self.bounds.get('lon_max', 180)
+            }
+            
+            # Check if bounds are valid
+            if not self.check_bounds_validity():
+                raise ValueError("Invalid bounds configuration in the config file.")
+            
+        # Post request configuration
+        self.post_enabled = CONFIG.get('post_enabled', False)
+        if self.post_enabled:
+            self.post_config = CONFIG.get('post_config', {})
+            if not self.post_config:
+                raise ValueError("Post configuration is enabled but no post_config is provided in the configuration file.")
+            is_valid, message = self.validate_post_config(self.post_config)
+            if not is_valid:
+                raise ValueError(f"Post configuration validation failed: {message}")
+            self.post_body_type = self.post_config.get('post_body_type', 'json')
 
     def start(self) -> None:
         LOGGER.info("Starting download worker")
@@ -87,33 +175,25 @@ class DownloadWorker(BaseDownloader):
 
             self.status = "ready"
             self.queue.task_done()
-            
-    def check_coordinates(self, coordinates):
-        """
-        Check if the coordinates are within the defined bounds.
-        """
-        # Check if coordinates are a list of coordinates, or just a single coordinate
-        # If it's a single coordinate, it should be a list of two elements [lat, lon]
-        # if it's a list of coordinates, it should be a list of lists
-        if isinstance(coordinates, list) and all(isinstance(coord, list) for coord in coordinates):
-            # Check if any coordinate pair is within bounds
-            return any(self.check_coordinates(coord) for coord in coordinates)
-        # If it's a single coordinate, check if it's a list of two elements
-        if not coordinates or not isinstance(coordinates, list) or len(coordinates) < 2:
-            return False
-        lat, lon = coordinates[0], coordinates[1]
-        return (self.LAT_MIN <= lat <= self.LAT_MAX and
-                self.LON_MIN <= lon <= self.LON_MAX)
 
     def get_free_space(self):
         total, used, free = shutil.disk_usage(self.basepath)
         return free
 
     def process_job(self, job) -> None:
+        
+        if self.check_bounds and not self.is_job_within_bounds(job):
+            LOGGER.info(f"Skipping job {job} as it is outside the defined bounds.")
+            return
+        
+        yyyy, mm, dd = get_todays_date()
+        output_dir = self.basepath / yyyy / mm / dd
+
+        # Add target to output directory
+        output_dir = output_dir / job.get("target", ".")
 
         # Get information about the job for verification later
-        expected_hash, hash_function_method = self.get_hash_info(job) # Renamed to avoid confusion with actual callable
-
+        expected_hash, hash_function = self.get_hash_info(job)
 
         # Get the download url, update status, and file type from the job links
         _url, update, media_type, expected_size = self.get_download_url(job)
@@ -129,37 +209,98 @@ class DownloadWorker(BaseDownloader):
         # the data_id for uniqueness. However, this can be unwieldy, hence use
         # hash of data_id
         data_id = job.get('payload', {}).get('properties', {}).get('data_id')
-        
-        # Get the coordinates from the job payload
-        coordinates = job.get('payload', {}).get('geometry', [])
-        coordinates = coordinates.get("coordinates", []) if isinstance(coordinates, dict) else coordinates
-        LOGGER.info(f"Coordinates for job {data_id}: {coordinates}")
-        
-        # Check if the coordinates are within the defined bounds
-        if not self.check_coordinates(coordinates):
-            LOGGER.warning(f"Coordinates {coordinates} are out of bounds, skipping download for job {data_id}")
+        filename, _ = self.extract_filename(_url)
+        filename = filename + '.' + file_type
+        target = output_dir / filename
+        # Create parent dir if it doesn't exist
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        # Only download if file doesn't exist or is an update
+        is_duplicate = target.is_file() and not update
+        if is_duplicate:
+            LOGGER.info(f"Skipping download of {filename}, already exists")
             return
-        
-        LOGGER.info(f"Coordinates {coordinates} are within bounds, proceeding with download for job {data_id}")  # noqa         
-        
+
         # Get information needed for download metric labels
         topic, centre_id = self.get_topic_and_centre(job)
+
+        # Standardise the file type label, defaulting to 'other'
+        all_type_labels = ['bufr', 'grib', 'json', 'xml', 'png']
+        file_type_label = 'other'
+
+        for label in all_type_labels:
+            if label in file_type:
+                file_type_label = label
+                break
+
+        # Start timer of download time to be logged later
+        download_start = dt.now()
+
+        # Download the file
+        response = None
+        try:
+            response = self.http.request('GET', _url)
+            # Check the response status code
+            if response.status != 200:
+                LOGGER.error(f"Error downloading {_url}, received status code: {response.status}")
+                # Increment failed download counter
+                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+                return
+            # Get the filesize in KB
+            filesize = len(response.data)
+        except Exception as e:
+            LOGGER.error(f"Error downloading {_url}")
+            LOGGER.error(e)
+            # Increment failed download counter
+            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+            return
+
+        if self.min_free_space > 0:  # only check size if limit set
+            free_space = self.get_free_space()
+            if free_space < self.min_free_space:
+                LOGGER.warning(f"Too little free space, {free_space - filesize} < {self.min_free_space} , file {data_id} not saved")  # noqa
+                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+                return
+
+        if response is None:
+            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+            return
+
+        # Use the hash function to determine whether to save the data
+        save_data = self.validate_data(
+            response.data, expected_hash, hash_function, expected_size)
+
+        if not save_data:
+            LOGGER.warning(f"Download {data_id} failed verification, discarding")  # noqa
+            # Increment failed download counter
+            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+            return
+
+        # Now save
+        if self.save_bufr:
+            self.save_file(response.data, target, filename,
+                       filesize, download_start)
         
-        # Prepare metadata to pass to the Celery task
-        job_metadata = {
-            'target': job.get('target', '.'),
-            'expected_hash': expected_hash,
-            'hash_method': hash_function_method, # Pass the method name, not the function object
-            'expected_size': expected_size,
-            'media_type': media_type,
-            'topic': topic,
-            'centre_id': centre_id,
-            'data_id': data_id,
-            'update': update, # Pass 'update' flag as well if needed in task
-        }
-        
-        # Enqueue the task to Celery
-        process_downloaded_file.delay(_url, job_metadata, str(self.basepath))
+        # Dispatch to Celery for processing
+        if self.save_geojson or self.post_enabled:
+            LOGGER.info(f"Dispatching Celery task for data_id: {data_id}")
+            process_bufr_data.delay(
+            bufr_content_bytes=response.data,
+            data_id=data_id,
+            save_geojson_locally=self.save_geojson,
+            geojson_storage_path=str(self.geojson_dir) if self.geojson_dir else None,
+            bufr2geojson_path=self.bufr2geojson_path,
+            post_config=self.post_config if self.post_enabled else None
+        )
+
+
+        # Increment metrics
+        DOWNLOADED_BYTES.labels(
+            topic=topic, centre_id=centre_id,
+            file_type=file_type_label).inc(filesize)
+        DOWNLOADED_FILES.labels(
+            topic=topic, centre_id=centre_id,
+            file_type=file_type_label).inc(1)
 
     def get_topic_and_centre(self, job) -> tuple:
         topic = job.get('topic')
@@ -171,7 +312,16 @@ class DownloadWorker(BaseDownloader):
         hash_method = job.get('payload', {}).get(
             'properties', {}).get('integrity', {}).get('method')
 
-        return expected_hash, hash_method
+        hash_function = None
+
+        # Check if hash method is known using our enumumeration of hash methods
+        if hash_method in VerificationMethods._member_names_:
+            # get method
+            method = VerificationMethods[hash_method].value
+            # load and return from the hashlib library
+            hash_function = getattr(hashlib, method, None)
+
+        return expected_hash, hash_function
 
     def get_download_url(self, job) -> tuple:
         links = job.get('payload', {}).get('links', [])
@@ -199,3 +349,175 @@ class DownloadWorker(BaseDownloader):
         filename = os.path.basename(path)
         filename, filename_ext = os.path.splitext(filename)
         return filename, filename_ext
+
+    def check_coordinates(self, coordinates) -> bool:
+        """
+        Checks if coordinates are within the defined bounds from the config.
+        """
+        if isinstance(coordinates, list) and all(isinstance(coord, list) for coord in coordinates):
+            return any(self.check_coordinates(coord) for coord in coordinates)
+
+        if not isinstance(coordinates, list) or len(coordinates) < 2:
+            return False
+        
+        lon, lat = coordinates[0], coordinates[1]
+        if not all(isinstance(c, (int, float)) for c in [lon, lat]):
+            return False
+
+        return (self.bounds['lat_min'] <= lat <= self.bounds['lat_max'] and
+                self.bounds['lon_min'] <= lon <= self.bounds['lon_max'])
+        
+    def check_bounds_validity(self) -> bool:
+        """
+        Checks if the bounds defined in the config are valid.
+        Returns True if valid, False otherwise.
+        """
+        if not self.check_bounds:
+            return True
+        
+        lat_min = self.bounds['lat_min']
+        lat_max = self.bounds['lat_max']
+        lon_min = self.bounds['lon_min']
+        lon_max = self.bounds['lon_max']
+        
+        # Check if bounds are valid
+        if not self.check_bounds_validity():
+            LOGGER.warning("Invalid bounds detected.")
+            return False
+
+        return (lat_min <= lat_max and lon_min <= lon_max and
+                -90 <= lat_min <= 90 and -90 <= lat_max <= 90 and
+                -180 <= lon_min <= 180 and -180 <= lon_max <= 180)
+        
+    def is_job_within_bounds(self, job) -> bool:
+        """
+        Checks if the job's coordinates are present and within the defined bounds.
+        Returns False if coordinates are missing or out of bounds.
+        """
+        geometry = job.get('payload', {}).get('geometry')
+        
+        if not geometry:
+            data_id = job.get('payload', {}).get('properties', {}).get('data_id', 'Unknown')
+            LOGGER.info(f"Skipping {data_id}: No geometry found in payload.")
+            return False
+
+        coordinates = geometry.get('coordinates')
+        if not coordinates:
+            data_id = job.get('payload', {}).get('properties', {}).get('data_id', 'Unknown')
+            LOGGER.info(f"Skipping {data_id}: No coordinates found to check against bounds.")
+            return False
+
+        return self.check_coordinates(coordinates)
+    
+    def validate_and_get_executable_path(path_from_config: str) -> str:
+        """
+        Validates the user-provided path for an executable.
+
+        Args:
+            path_from_config: The path string from the config file.
+
+        Returns:
+            The absolute path to the executable if found.
+
+        Raises:
+            FileNotFoundError: If the executable cannot be found.
+        """
+        # shutil.which() searches the PATH for a command or verifies an absolute path.
+        absolute_path = shutil.which(path_from_config)
+
+        if absolute_path is None:
+            raise FileNotFoundError(
+                f"The executable could not be found for '{path_from_config}'. "
+                "Please ensure it's installed and the path in your config is correct."
+            )
+
+        return absolute_path
+    
+    def check_geojson_conversion(self) -> bool:
+        """
+        Check if the geojson conversion is enabled and the path to bufr2geojson is valid.
+        """
+        if not self.use_celery:
+            LOGGER.warning("Celery is not enabled, skipping GeoJSON conversion check.")
+            return False
+        if not self.geojson_dir:
+            LOGGER.warning("GeoJSON directory is not set.")
+            return False
+        if not self.bufr2geojson_path:
+            LOGGER.warning("Path to bufr2geojson is not set.")
+            return False
+        if not self.validate_and_get_executable_path(self.bufr2geojson_path):
+            LOGGER.warning(f"bufr2geojson executable not found at {self.bufr2geojson_path}.")
+            return False
+        return True
+    
+    def validate_post_config(config: dict) -> tuple[bool, str]:
+        """
+        Validates the post configuration dictionary to ensure it's proper.
+
+        Args:
+            config: The configuration dictionary to validate.
+
+        Returns:
+            A tuple containing:
+            - A boolean (True if valid, False otherwise).
+            - A string message explaining the result.
+        """
+        # Check for mandatory base keys
+        required_keys = ["post_url", "post_body_type"]
+        for key in required_keys:
+            if key not in config:
+                return False, f"Validation failed: Missing required key '{key}'"
+
+        # Validate the 'post_body_type' value
+        post_type = config["post_body_type"]
+        if post_type not in ["json", "binary"]:
+            return False, f"Validation failed: 'post_body_type' must be 'json' or 'binary', not '{post_type}'"
+
+        # Perform conditional validation based on the post type
+        if post_type == "binary":
+            # If posting a binary file, 'binary_content_type' is required
+            if "binary_content_type" not in config:
+                return False, "Validation failed: Missing 'binary_content_type' for post_body_type 'binary'"
+            if not isinstance(config["binary_content_type"], str):
+                return False, "Validation failed: 'binary_content_type' must be a string."
+
+        # Validate the types of optional keys if they exist
+        if "post_headers" in config and not isinstance(config["post_headers"], dict):
+            return False, "Validation failed: 'post_headers' must be a dictionary."
+
+        if "post_timeout" in config and not isinstance(config["post_timeout"], (int, float)):
+            return False, "Validation failed: 'post_timeout' must be a number."
+
+        # If all checks pass, the configuration is valid
+        return True, "Validation successful: Configuration is valid."
+
+    def validate_data(self, data, expected_hash,
+                      hash_function, expected_size) -> bool:
+        if None in (expected_hash, hash_function,
+                    hash_function):
+            return True
+
+        try:
+            hash_value = hash_function(data).digest()
+            hash_value = base64.b64encode(hash_value).decode()
+        except Exception as e:
+            LOGGER.error(e)
+            return False
+        if (hash_value != expected_hash) or (len(data) != expected_size):
+            return False
+
+        return True
+
+    def save_file(self, data, target, filename, filesize,
+                  download_start) -> None:
+        try:
+            target.write_bytes(data)
+            download_end = dt.now()
+            download_time = download_end - download_start
+            download_seconds = round(download_time.total_seconds(), 2)
+            LOGGER.info(
+                f"Downloaded {filename} of size {filesize} bytes in {download_seconds} seconds")  # noqa
+        except Exception as e:
+            LOGGER.error(f"Error saving to disk: {target}")
+            LOGGER.error(e)
