@@ -15,7 +15,8 @@ from wis2downloader.queue import BaseQueue
 from wis2downloader.metrics import (DOWNLOADED_BYTES, DOWNLOADED_FILES,
                                     FAILED_DOWNLOADS)
 from wis2downloader.tasks import process_bufr_data
-from wis2downloader.app import CONFIG
+from wis2downloader.utils.config import CONFIG
+from wis2downloader.celery_app import app as celery_app_instance
 
 class BaseDownloader(ABC):
 
@@ -110,6 +111,9 @@ class DownloadWorker(BaseDownloader):
         
         # Check if Celery is enabled and set up the flags accordingly
         self.use_celery = CONFIG.get('use_celery', False)
+        if self.use_celery:
+            # Create a dedicated Celery app instance for this worker
+            self.celery_app = celery_app_instance
         
         # Set up directories and paths
         self.basepath = self.basepath.resolve()
@@ -119,24 +123,17 @@ class DownloadWorker(BaseDownloader):
         # Set up directories for saving downloaded files
         self.save_bufr = CONFIG.get('save_bufr', True)
         self.save_geojson = CONFIG.get('save_geojson', False)
-        self.download_dir = CONFIG.get('download_dir', self.basepath / 'downloads')
-        self.geojson_dir = CONFIG.get('geojson_dir', self.basepath / 'geojson')
+        self.download_dir = Path(CONFIG.get('download_dir', self.basepath / 'downloads')).resolve()
+        self.geojson_dir = Path(CONFIG.get('geojson_dir', self.basepath / 'geojson')).resolve()
         
-        if self.save_bufr:
-            # Check if the download directory exists, if not create it
-            if not self.download_dir.is_dir():
-                self.download_dir.mkdir(parents=True, exist_ok=True)
-            self.download_dir = self.download_dir.resolve()
-        else:
-            self.download_dir = None
-            
+        if not self.download_dir.is_dir():
+            self.download_dir.mkdir(parents=True, exist_ok=True)
+
         if self.save_geojson:
-            # Check if the geojson directory exists, if not create it
+            if not self.use_celery:
+                raise ValueError("save_geojson is true, but use_celery is false. Celery is required for GeoJSON conversion.")
             if not self.geojson_dir.is_dir():
                 self.geojson_dir.mkdir(parents=True, exist_ok=True)
-            self.geojson_dir = self.geojson_dir.resolve()
-        else:
-            self.geojson_dir = None
             
         
         self.bufr2geojson_path = "bufr2geojson"
@@ -177,6 +174,10 @@ class DownloadWorker(BaseDownloader):
         while not stop_event.is_set():
             # First get the job from the queue
             job = self.queue.dequeue()
+            if not job:
+                self.queue.task_done()
+                continue
+            
             if job.get('shutdown', False):
                 break
 
@@ -301,17 +302,19 @@ class DownloadWorker(BaseDownloader):
                        filesize, download_start)
         
         # Dispatch to Celery for processing
-        if self.save_geojson or self.post_enabled:
+        if self.use_celery and (self.save_geojson or self.post_enabled):
             LOGGER.info(f"Dispatching Celery task for data_id: {data_id}")
-            process_bufr_data.delay(
-            bufr_content_bytes=response.data,
-            data_id=data_id,
-            save_geojson_locally=self.save_geojson,
-            geojson_storage_path=str(self.geojson_dir) if self.geojson_dir else None,
-            bufr2geojson_path=self.bufr2geojson_path,
-            post_config=self.post_config if self.post_enabled else None
-        )
-
+            self.celery_app.send_task(
+                'process_bufr_data',
+                kwargs={
+                    'bufr_content_bytes': response.data,
+                    'data_id': data_id,
+                    'save_geojson_locally': self.save_geojson,
+                    'geojson_storage_path': str(self.geojson_dir) if self.geojson_dir else None,
+                    'bufr2geojson_path': self.bufr2geojson_path,
+                    'post_config': self.post_config if self.post_enabled else None
+                }
+            )
 
         # Increment metrics
         DOWNLOADED_BYTES.labels(
@@ -442,6 +445,7 @@ class DownloadWorker(BaseDownloader):
         if not path_from_config:
             raise ValueError("'bufr2geojson_path' must be set in config when celery is enabled.")
         absolute_path = shutil.which(path_from_config)
+        LOGGER.debug(f"Absolute path for '{path_from_config}': {absolute_path}")
         if absolute_path is None:
             raise FileNotFoundError(
                 f"The executable could not be found for '{path_from_config}'. "

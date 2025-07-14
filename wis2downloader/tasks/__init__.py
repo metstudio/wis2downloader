@@ -3,11 +3,11 @@ import subprocess
 import tempfile
 import pathlib
 import urllib3
-from ..celery_app import app
+from celery import shared_task
 from wis2downloader.log import LOGGER
 from wis2downloader.utils.validate_celery_tasks import post_data
 
-@app.task(bind=True, name='process_bufr_data')
+@shared_task(bind=True, name='process_bufr_data')
 def process_bufr_data(self, bufr_content_bytes: bytes, data_id: str,
                       bufr2geojson_path: str | None,
                       post_config: dict | None,
