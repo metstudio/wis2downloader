@@ -14,7 +14,6 @@ from wis2downloader.log import LOGGER
 from wis2downloader.queue import BaseQueue
 from wis2downloader.metrics import (DOWNLOADED_BYTES, DOWNLOADED_FILES,
                                     FAILED_DOWNLOADS)
-from wis2downloader.tasks import process_bufr_data
 from wis2downloader.utils.config import CONFIG
 from wis2downloader.celery_app import app as celery_app_instance
 
