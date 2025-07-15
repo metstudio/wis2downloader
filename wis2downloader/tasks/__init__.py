@@ -12,7 +12,8 @@ def process_bufr_data(self, bufr_content_bytes: bytes, data_id: str,
                       bufr2geojson_path: str | None,
                       post_config: dict | None,
                       save_geojson_locally: bool,
-                      geojson_storage_path: str | None):
+                      geojson_storage_path: str | None,
+                      date: str | None = None):
     """
     A Celery task that can:
     1. Post raw BUFR data.
@@ -57,9 +58,16 @@ def process_bufr_data(self, bufr_content_bytes: bytes, data_id: str,
                 with open(json_file_path, 'r') as f:
                     geojson_data = json.load(f)
 
-                # --- Action 2a: Save the GeoJSON file locally if requested ---
+                # Save the GeoJSON file locally if requested ---
                 if save_geojson_locally and geojson_storage_path:
                     storage_path = pathlib.Path(geojson_storage_path)
+                    yyyy, mm, dd = date.split('-') if date else (None, None, None)
+                    if yyyy and mm and dd:
+                        storage_path = storage_path / yyyy / mm / dd / data_id
+                        storage_path.mkdir(parents=True, exist_ok=True)
+                    else:
+                        storage_path = storage_path / data_id
+                        storage_path.mkdir(parents=True, exist_ok=True)
                     output_file = storage_path / json_file_path.name
                     try:
                         with open(output_file, 'w') as f_out:
@@ -68,7 +76,7 @@ def process_bufr_data(self, bufr_content_bytes: bytes, data_id: str,
                     except Exception as e:
                         LOGGER.error(f"Failed to save GeoJSON to {output_file}: {e}")
 
-                # --- Action 2b: Post the GeoJSON data if requested ---
+                # Post the GeoJSON data if requested ---
                 if post_config and post_config.get("post_body_type") == "json":
                     LOGGER.info(f"Posting GeoJSON from {json_file_path.name} for {data_id}.")
                     post_data(config=post_config, json_payload=geojson_data)

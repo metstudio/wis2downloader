@@ -311,7 +311,8 @@ class DownloadWorker(BaseDownloader):
                     'save_geojson_locally': self.save_geojson,
                     'geojson_storage_path': str(self.geojson_dir) if self.geojson_dir else None,
                     'bufr2geojson_path': self.bufr2geojson_path,
-                    'post_config': self.post_config if self.post_enabled else None
+                    'post_config': self.post_config if self.post_enabled else None,
+                    'date': get_todays_date(),
                 }
             )
 
