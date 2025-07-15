@@ -61,7 +61,7 @@ def process_bufr_data(self, bufr_content_bytes: bytes, data_id: str,
                 # Save the GeoJSON file locally if requested ---
                 if save_geojson_locally and geojson_storage_path:
                     storage_path = pathlib.Path(geojson_storage_path)
-                    yyyy, mm, dd = date.split('-') if date else (None, None, None)
+                    yyyy, mm, dd = date if date else (None, None, None)
                     if yyyy and mm and dd:
                         storage_path = storage_path / yyyy / mm / dd / data_id
                         storage_path.mkdir(parents=True, exist_ok=True)
