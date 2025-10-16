@@ -195,134 +195,106 @@ class DownloadWorker(BaseDownloader):
 
     def process_job(self, job) -> None:
         """
-        Process a single job from the queue.
-        Args:
-            job: The job to process, which is a dictionary containing the job details.
+        Processes a single job.
+        If Celery is enabled, it dispatches the download task.
+        Otherwise, it performs the download directly.
         """
         data_id = job.get('payload', {}).get('properties', {}).get('data_id', 'Unknown Job')
-        
+
         if self.check_bounds and not self.is_job_within_bounds(job):
             LOGGER.info(f"Skipping {data_id} as it is outside the defined bounds.")
             return
-        
-        yyyy, mm, dd = get_todays_date()
-        output_dir = self.basepath / yyyy / mm / dd
 
-        # Add target to output directory
-        output_dir = output_dir / job.get("target", ".")
-
-        # Get information about the job for verification later
-        expected_hash, hash_function = self.get_hash_info(job)
-
-        # Get the download url, update status, and file type from the job links
+        # --- Gather all necessary data for dispatching or local processing ---
         _url, update, media_type, expected_size = self.get_download_url(job)
 
         if _url is None:
-            LOGGER.warning(f"No download link found in job {job}")
+            LOGGER.warning(f"No download link found in job for {data_id}")
             return
 
-        # map media type to file extension
-        file_type = map_media_type(media_type)
+        expected_hash, hash_function = self.get_hash_info(job)
+        # Get the hash method NAME (string) for Celery serialization
+        hash_method = job.get('payload', {}).get(
+            'properties', {}).get('integrity', {}).get('method')
 
-        # Global caches can set whatever filename they want, we need to use
-        # the data_id for uniqueness. However, this can be unwieldy, hence use
-        # hash of data_id
-        data_id = job.get('payload', {}).get('properties', {}).get('data_id')
+        yyyy, mm, dd = get_todays_date()
+        # Use the configured self.download_dir for consistency
+        output_dir = self.download_dir / yyyy / mm / dd / job.get("target", ".")
+
         filename, _ = self.extract_filename(_url)
-        filename = filename + '.' + file_type
-        target = output_dir / filename
-        # Create parent dir if it doesn't exist
-        target.parent.mkdir(parents=True, exist_ok=True)
+        filename += '.' + map_media_type(media_type)
+        target_path = output_dir / filename
 
-        # Only download if file doesn't exist or is an update
-        is_duplicate = target.is_file() and not update
-        if is_duplicate:
-            LOGGER.info(f"Skipping download of {filename}, already exists")
-            return
+        # --- Dispatch to Celery or process locally ---
+        if self.use_celery:
+            LOGGER.info(f"Dispatching download task to Celery for {data_id}")
 
-        # Get information needed for download metric labels
-        topic, centre_id = self.get_topic_and_centre(job)
-
-        # Standardise the file type label, defaulting to 'other'
-        all_type_labels = ['bufr', 'grib', 'json', 'xml', 'png']
-        file_type_label = 'other'
-
-        for label in all_type_labels:
-            if label in file_type:
-                file_type_label = label
-                break
-
-        # Start timer of download time to be logged later
-        download_start = dt.now()
-
-        # Download the file
-        response = None
-        try:
-            response = self.http.request('GET', _url)
-            # Check the response status code
-            if response.status != 200:
-                LOGGER.error(f"Error downloading {_url}, received status code: {response.status}")
-                # Increment failed download counter
-                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-                return
-            # Get the filesize in KB
-            filesize = len(response.data)
-        except Exception as e:
-            LOGGER.error(f"Error downloading {_url}")
-            LOGGER.error(e)
-            # Increment failed download counter
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-            return
-
-        if self.min_free_space > 0:  # only check size if limit set
-            free_space = self.get_free_space()
-            if free_space < self.min_free_space:
-                LOGGER.warning(f"Too little free space, {free_space - filesize} < {self.min_free_space} , file {data_id} not saved")  # noqa
-                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+            # Prevent re-dispatching if the file exists and is not an update
+            if target_path.is_file() and not update:
+                LOGGER.info(f"Skipping task for {filename}, already exists.")
                 return
 
-        if response is None:
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-            return
-
-        # Use the hash function to determine whether to save the data
-        save_data = self.validate_data(
-            response.data, expected_hash, hash_function, expected_size)
-
-        if not save_data:
-            LOGGER.warning(f"Download {data_id} failed verification, discarding")  # noqa
-            # Increment failed download counter
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-            return
-
-        # Now save
-        if self.save_bufr:
-            self.save_file(response.data, target, filename,
-                       filesize, download_start)
-        
-        # Dispatch to Celery for processing
-        if self.use_celery and (self.save_geojson or self.post_enabled):
-            LOGGER.info(f"Dispatching Celery task for data_id: {data_id}")
             self.celery_app.send_task(
-                'process_bufr_data',
+                'download_and_process_data',
                 kwargs={
-                    'bufr_content_bytes': response.data,
-                    'data_id': data_id,
+                    'download_url': _url,
+                    'target_path': str(target_path),
+                    'expected_hash': expected_hash,
+                    'hash_method': hash_method,
+                    'expected_size': expected_size,
+                    'min_free_space': self.min_free_space,
+                    'basepath_for_space_check': str(self.basepath),
+                    'save_bufr': self.save_bufr,
+                    'post_config': self.post_config if self.post_enabled else None,
                     'save_geojson_locally': self.save_geojson,
                     'geojson_storage_path': str(self.geojson_dir) if self.geojson_dir else None,
                     'bufr2geojson_path': self.bufr2geojson_path,
-                    'post_config': self.post_config if self.post_enabled else None,
-                    'date': get_todays_date(),
+                    'date': (yyyy, mm, dd),
+                    'job_details': {
+                        'data_id': data_id,
+                        'topic': job.get('topic'),
+                    }
                 }
             )
+        else:
+            LOGGER.info(f"Processing download locally for {data_id} (Celery disabled).")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Increment metrics
-        DOWNLOADED_BYTES.labels(
-            topic=topic, centre_id=centre_id,
-            file_type=file_type_label).inc(filesize)
-        DOWNLOADED_FILES.labels(
-            topic=topic, centre_id=centre_id,
-            file_type=file_type_label).inc(1)
+            if target_path.is_file() and not update:
+                LOGGER.info(f"Skipping download of {filename}, already exists")
+                return
+
+            topic, centre_id = self.get_topic_and_centre(job)
+            download_start = dt.now()
+            response = None
+            try:
+                response = self.http.request('GET', _url)
+                if response.status != 200:
+                    LOGGER.error(f"Error downloading {_url}, status: {response.status}")
+                    FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+                    return
+                filesize = len(response.data)
+            except Exception as e:
+                LOGGER.error(f"Error downloading {_url}: {e}")
+                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+                return
+
+            if self.min_free_space > 0:
+                if self.get_free_space() < self.min_free_space:
+                    LOGGER.warning(f"Too little free space, file {data_id} not saved")
+                    FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+                    return
+
+            if not self.validate_data(response.data, expected_hash, hash_function, expected_size):
+                LOGGER.warning(f"Download {data_id} failed verification, discarding")
+                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+                return
+
+            if self.save_bufr:
+                self.save_file(response.data, target_path, filename, filesize, download_start)
+
+            DOWNLOADED_BYTES.labels(topic=topic, centre_id=centre_id, file_type='bufr').inc(filesize)
+            DOWNLOADED_FILES.labels(topic=topic, centre_id=centre_id, file_type='bufr').inc(1)
 
     def get_topic_and_centre(self, job) -> tuple:
         topic = job.get('topic')
