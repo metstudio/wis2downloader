@@ -1,5 +1,4 @@
 import json
-import subprocess
 import tempfile
 import pathlib
 import urllib3
@@ -7,14 +6,18 @@ import hashlib
 import base64
 import shutil
 from datetime import datetime as dt
-
 from celery import shared_task
 from wis2downloader.log import LOGGER
 from wis2downloader.utils.validate_celery_tasks import post_data
-from wis2downloader.metrics import (DOWNLOADED_BYTES, DOWNLOADED_FILES,
-                                    FAILED_DOWNLOADS)
-# Assumes the VerificationMethods Enum is in the downloader module
+from wis2downloader.metrics import (DOWNLOADED_BYTES, DOWNLOADED_FILES, FAILED_DOWNLOADS)
 from wis2downloader.downloader import VerificationMethods
+
+# Import the bufr2geojson transform function
+try:
+    from bufr2geojson.data import transform as bufr2geojson_transform
+except ImportError:
+    # This will be used to log an error inside the task
+    bufr2geojson_transform = None
 
 
 @shared_task(bind=True, name='download_and_process_data')
@@ -108,7 +111,6 @@ def download_and_process_data(self, download_url: str, target_path: str, expecte
     post_config = kwargs.get('post_config')
     save_geojson_locally = kwargs.get('save_geojson_locally', False)
     geojson_storage_path = kwargs.get('geojson_storage_path')
-    bufr2geojson_path = kwargs.get('bufr2geojson_path')
     date = kwargs.get('date')
 
     # Post the raw binary data if configured
@@ -120,56 +122,48 @@ def download_and_process_data(self, download_url: str, target_path: str, expecte
     if not save_geojson_locally and (not post_config or post_config.get("post_body_type") != "json"):
         LOGGER.info(f"[Celery Task] No GeoJSON action required for {data_id}. Task finished.")
         return
-
-    if not bufr2geojson_path:
-        LOGGER.error(f"[Celery Task] Cannot process to GeoJSON for {data_id}: bufr2geojson_path not provided.")
+    
+    if not bufr2geojson_transform:
+        LOGGER.error(f"[Celery Task] Cannot process {data_id}: bufr2geojson library not installed. "
+                     "Install with 'pip install wis2downloader[redis]' or '[rabbitmq]'.")
         return
 
     # Convert BUFR to GeoJSON using a temporary directory
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_dir_path = pathlib.Path(temp_dir)
-        try:
-            subprocess.run(
-                [bufr2geojson_path, 'data', 'transform', '-', '--output-dir', str(temp_dir_path)],
-                input=bufr_content_bytes,
-                capture_output=True,
-                check=True
-            )
+    try:
+        # This function returns a dict like: {'file1.json': {...}, 'file2.json': {...}}
+        geojson_outputs = bufr2geojson_transform(bufr_content_bytes)
 
-            generated_files = list(temp_dir_path.glob('*.json'))
-            if not generated_files:
-                LOGGER.warning(f"[Celery Task] bufr2geojson ran for {data_id} but produced no output.")
+        if not geojson_outputs:
+            LOGGER.warning(f"[Celery Task] bufr2geojson ran for {data_id} but produced no output.")
+            return
 
-            for json_file_path in generated_files:
-                with open(json_file_path, 'r') as f:
-                    geojson_data = json.load(f)
+        # Loop through the dictionary of results
+        for file_name, geojson_data in geojson_outputs.items():
+            
+            # Save the resulting GeoJSON file locally if requested
+            if save_geojson_locally and geojson_storage_path:
+                storage_path = pathlib.Path(geojson_storage_path)
+                yyyy, mm, dd = date if date else (None, None, None)
+                if yyyy and mm and dd:
+                    storage_path = storage_path / yyyy / mm / dd / data_id
+                else:
+                    storage_path = storage_path / data_id
+                storage_path.mkdir(parents=True, exist_ok=True)
+                
+                output_file = storage_path / file_name  # Use the file_name from the dict
+                try:
+                    with open(output_file, 'w') as f_out:
+                        json.dump(geojson_data, f_out, indent=4)
+                    LOGGER.info(f"[Celery Task] Saved GeoJSON for {data_id} to {output_file}")
+                except Exception as e:
+                    LOGGER.error(f"[Celery Task] Failed to save GeoJSON to {output_file}: {e}")
 
-                # Save the resulting GeoJSON file locally if requested
-                if save_geojson_locally and geojson_storage_path:
-                    storage_path = pathlib.Path(geojson_storage_path)
-                    yyyy, mm, dd = date if date else (None, None, None)
-                    if yyyy and mm and dd:
-                        storage_path = storage_path / yyyy / mm / dd / data_id
-                    else:
-                        storage_path = storage_path / data_id
-                    storage_path.mkdir(parents=True, exist_ok=True)
-                    
-                    output_file = storage_path / json_file_path.name
-                    try:
-                        with open(output_file, 'w') as f_out:
-                            json.dump(geojson_data, f_out, indent=4)
-                        LOGGER.info(f"[Celery Task] Saved GeoJSON for {data_id} to {output_file}")
-                    except Exception as e:
-                        LOGGER.error(f"[Celery Task] Failed to save GeoJSON to {output_file}: {e}")
+            # Post the GeoJSON data if requested
+            if post_config and post_config.get("post_body_type") == "json":
+                LOGGER.info(f"[Celery Task] Posting GeoJSON from {file_name} for {data_id}.")
+                post_data(config=post_config, json_payload=geojson_data)
 
-                # Post the GeoJSON data if requested
-                if post_config and post_config.get("post_body_type") == "json":
-                    LOGGER.info(f"[Celery Task] Posting GeoJSON from {json_file_path.name} for {data_id}.")
-                    post_data(config=post_config, json_payload=geojson_data)
-
-        except subprocess.CalledProcessError as e:
-            LOGGER.error(f"[Celery Task] bufr2geojson failed for {data_id}: {e.stderr.decode('utf-8')}")
-        except Exception as e:
-            LOGGER.error(f"[Celery Task] An unexpected error occurred during post-processing for {data_id}: {e}", exc_info=True)
+    except Exception as e:
+        LOGGER.error(f"[Celery Task] bufr2geojson (Python library) failed for {data_id}: {e}", exc_info=True)
 
     LOGGER.info(f"[Celery Task] Task fully completed for data_id: {data_id}")
