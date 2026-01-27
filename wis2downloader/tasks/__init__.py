@@ -20,7 +20,7 @@ except ImportError:
     bufr2geojson_transform = None
 
 
-@shared_task(bind=True, name='download_and_process_data')
+@shared_task(bind=True, name='download_and_process_data', ignore_result=True)
 def download_and_process_data(self, download_url: str, target_path: str, expected_hash: str,
                               hash_method: str, expected_size: int, save_bufr: bool,
                               min_free_space: int, basepath_for_space_check: str,

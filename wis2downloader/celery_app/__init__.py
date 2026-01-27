@@ -34,6 +34,8 @@ if use_celery:
         timezone= celery_config.get('timezone', 'UTC'),
         enable_utc= celery_config.get('enable_utc', True),
         worker_concurrency= celery_config.get('worker_concurrency', 4),
+        task_ignore_result=True,  # Don't store task results in Redis
+        result_expires=3600,  # Expire results after 1 hour (backup safety)
     )
     
     print("Celery app initialized successfully.")
