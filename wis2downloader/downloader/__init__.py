@@ -100,7 +100,11 @@ class VerificationMethods(enum.Enum):
 class DownloadWorker(BaseDownloader):
     def __init__(self, queue: BaseQueue, basepath: str = ".", min_free_space=10):  # noqa
         timeout = urllib3.Timeout(connect=1.0)
-        self.http = urllib3.PoolManager(timeout=timeout)
+        self.http = urllib3.PoolManager(
+            timeout=timeout,
+            maxsize=10,  # Max connections per host
+            block=False  # Don't block when pool is full
+        )
         self.queue = queue
         self.basepath = Path(basepath)
         self.min_free_space = min_free_space * 1073741824  # GBytes
@@ -516,3 +520,17 @@ class DownloadWorker(BaseDownloader):
         except Exception as e:
             LOGGER.error(f"Error saving to disk: {target}")
             LOGGER.error(e)
+
+    def __del__(self):
+        """
+        Cleanup resources when worker is destroyed.
+
+        This prevents memory leaks by explicitly clearing the urllib3 connection pool
+        when the DownloadWorker instance is garbage collected.
+        """
+        if hasattr(self, 'http'):
+            try:
+                self.http.clear()
+                LOGGER.debug("DownloadWorker: HTTP connection pool cleared")
+            except Exception as e:
+                LOGGER.warning(f"Error clearing HTTP pool in DownloadWorker cleanup: {e}")

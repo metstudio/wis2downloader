@@ -20,6 +20,28 @@ except ImportError:
     bufr2geojson_transform = None
 
 
+# Singleton HTTP pool to prevent memory leaks from creating multiple PoolManager instances
+_http_pool = None
+
+
+def get_http_pool():
+    """
+    Get or create a singleton HTTP pool for all Celery tasks.
+
+    This prevents memory leaks by reusing a single PoolManager instance
+    across all task executions instead of creating a new one per task.
+    """
+    global _http_pool
+    if _http_pool is None:
+        timeout = urllib3.Timeout(connect=5.0, read=30.0)
+        _http_pool = urllib3.PoolManager(
+            timeout=timeout,
+            maxsize=10,  # Max connections per host
+            block=False  # Don't block when pool is full, raise exception instead
+        )
+    return _http_pool
+
+
 @shared_task(bind=True, name='download_and_process_data', ignore_result=True)
 def download_and_process_data(self, download_url: str, target_path: str, expected_hash: str,
                               hash_method: str, expected_size: int, save_bufr: bool,
@@ -38,11 +60,10 @@ def download_and_process_data(self, download_url: str, target_path: str, expecte
     LOGGER.info(f"[Celery Task] Starting download for: {data_id} from {download_url}")
 
     # 1. Download the file from the provided URL
-    http = urllib3.PoolManager()
+    # Use singleton HTTP pool to prevent memory leaks
+    http = get_http_pool()
     try:
-        # Set reasonable timeouts for connection and reading
-        timeout = urllib3.Timeout(connect=5.0, read=30.0)
-        response = http.request('GET', download_url, timeout=timeout)
+        response = http.request('GET', download_url)
         if response.status != 200:
             LOGGER.error(f"[Celery Task] Download failed for {data_id}. Status: {response.status}")
             FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
